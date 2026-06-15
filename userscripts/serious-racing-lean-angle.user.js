@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Serious-Racing — Telemetry Chart (Speed + Acc/Brk G + Lean) + Track Colouring
 // @namespace    https://serious-racing.com/
-// @version      2.8.0
-// @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot that follows the hovered point, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. Replaces the site's play/scrubber bar. JS-only, reads window.SRSRCNG — no server access needed.
+// @version      2.10.0
+// @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. When two riders are compared, switches to a speed-only chart (one line + dot per rider) on a time axis so the faster rider pulls ahead on the map. Hides the site's play/scrubber bar and its static rider markers. JS-only, reads window.SRSRCNG — no server access needed.
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
 // @grant        none
@@ -23,6 +23,11 @@
  *   2. Hover -> a dot on the live Leaflet map (window.SRSRCNG.map) at the point's GPS pos.
  *   3. The lap trace is recoloured green (accelerating) / yellow (steady) / red (braking)
  *      from the longitudinal-accel channel, as an overlay polyline we own.
+ *   4. COMPARISON mode (window.SRSRCNG.riders has >= 2 valid riders): the chart becomes
+ *      speed-only with one line per rider on a TIME axis. Hover/playback sample every rider
+ *      at the same elapsed time (clamped to its own lap length), so the faster rider's chart
+ *      dot + map dot pull ahead and you see who's leading. The legend shows each rider's live
+ *      speed. The accel-colour overlay is skipped so the site's per-rider traces stay visible.
  */
 (function () {
   'use strict';
@@ -91,6 +96,32 @@
     return (window.SRSRCNG && window.SRSRCNG.speedUnit) || 'km/h';
   }
 
+  // --- Comparison-mode helpers ---
+  // A rider is usable if it has at least [lat, lng, speed, distance] per point.
+  function validRiders() {
+    return ((window.SRSRCNG && window.SRSRCNG.riders) || []).filter(
+      (r) => r.data && r.data[0] && r.data[0].length >= 4 && r.data.length >= 2
+    );
+  }
+  function isCompare() {
+    return validRiders().length >= 2;
+  }
+  function riderColor(i) {
+    const colors = (window.SRSRCNG && window.SRSRCNG.seriesColors) || [];
+    const r = validRiders()[i];
+    return (r && r.color) || colors[i] || (i === 0 ? COLORS.speed : '#3d7fd6');
+  }
+  function riderLabel(i) {
+    const r = validRiders()[i];
+    return (r && r.username) || 'Rider ' + (i + 1);
+  }
+  // Comparison uses a TIME axis: at a given elapsed time the faster rider is further round
+  // the track, so the two map dots diverge (you see who's ahead). The x-axis spans the
+  // LONGEST lap so the whole "race" plays; a shorter lap's dot clamps at its finish.
+  function maxLapTime() {
+    return Math.max.apply(null, validRiders().map((r) => (r.data.length - 1) * DT));
+  }
+
   // mm:ss.cc  (e.g. 0:13.04, 2:34.40)
   function fmtTime(t) {
     const m = Math.floor(t / 60);
@@ -117,12 +148,30 @@
     ];
   }
 
+  // Comparison: one speed line per rider, x = elapsed time (s) from the lap start.
+  function buildCompareSeries() {
+    const mult = speedMult();
+    return validRiders().map((rider, i) => {
+      const pts = rider.data;
+      const data = [];
+      for (let j = 0; j < pts.length; j++) data.push([j * DT, pts[j][2] * mult]);
+      return {
+        label: riderLabel(i),
+        data: data,
+        color: riderColor(i),
+        lines: { lineWidth: 1.5 },
+        shadowSize: 0,
+      };
+    });
+  }
+
   function timeTicks(maxT) {
     const step = 20; // 20 s like the reference
     const ticks = [];
     for (let t = 0; t <= maxT + 0.001; t += step) ticks.push(t);
     return ticks;
   }
+
 
   function speedChartRow() {
     const ph = document.getElementById('sidebar-graph-container');
@@ -158,6 +207,20 @@
     return (deg < 0 ? 'L ' : 'R ') + Math.abs(deg).toFixed(0) + '°';
   }
 
+  // Legend chips depend on mode: single -> Speed/Acc-Brk/Lean; compare -> one per rider.
+  function legendHtml() {
+    if (isCompare()) {
+      return validRiders()
+        .map((r, i) => legendChip(riderColor(i), riderLabel(i), 'sr-leg-r' + i, 76))
+        .join('');
+    }
+    return (
+      legendChip(COLORS.speed, 'Speed', 'sr-leg-speed', 76) +
+      legendChip(COLORS.g, 'Acc/Brk G', 'sr-leg-g', 64) +
+      legendChip(COLORS.lean, 'Lean Angle', 'sr-leg-lean', 54)
+    );
+  }
+
   function setLegendValues(spd, accel, lean) {
     const set = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
     set('sr-leg-speed', (spd * speedMult()).toFixed(0) + ' ' + speedUnit());
@@ -165,11 +228,23 @@
     set('sr-leg-lean', fmtLean(lean));
   }
 
+  // Compare legend: raw per-rider speeds (col2 units), converted for display.
+  function setCompareLegend(speeds) {
+    speeds.forEach((spd, i) => {
+      const el = document.getElementById('sr-leg-r' + i);
+      if (el) el.textContent = (spd * speedMult()).toFixed(0) + ' ' + speedUnit();
+    });
+  }
+
   function updateLegend(idx) {
     const rider = primaryRider();
     if (!rider || !rider.data[idx]) return;
     const p = rider.data[idx];
     setLegendValues(p[2], p[4], p[5]);
+  }
+
+  function seedCompareLegend() {
+    setCompareLegend(validRiders().map((r) => r.data[0][2]));
   }
 
   const PLOT_H = 200; // px, chart plot area
@@ -190,9 +265,7 @@
       '<div style="position:relative;display:flex;justify-content:center;align-items:center;min-height:44px;' +
       'font-size:11px;color:#fff;padding:4px 8px 2px;">' +
       '<button id="sr-play" class="sr-play-btn" title="Play" aria-label="Play">' + ICON_PLAY + '</button>' +
-      legendChip(COLORS.speed, 'Speed', 'sr-leg-speed', 76) +
-      legendChip(COLORS.g, 'Acc/Brk G', 'sr-leg-g', 64) +
-      legendChip(COLORS.lean, 'Lean Angle', 'sr-leg-lean', 54) +
+      legendHtml() +
       '</div>' +
       '<div id="' + PLOT_ID + '" style="position:relative;width:100%;height:' + PLOT_H + 'px;"></div>';
 
@@ -206,6 +279,16 @@
   function hidePlaybackControls() {
     const c = document.getElementById('track-map-controls');
     if (c) c.style.display = 'none';
+  }
+
+  // Hide the site's own static rider position markers (SRSRCNG.dataMarker, one CircleMarker
+  // per rider, parked at the start line). Redundant now that we own the moving dots.
+  function hideSiteRiderMarkers() {
+    const dm = window.SRSRCNG && window.SRSRCNG.dataMarker;
+    const list = Array.isArray(dm) ? dm : dm ? [dm] : [];
+    list.forEach((m) => {
+      try { if (m && m.setStyle) m.setStyle({ opacity: 0, fillOpacity: 0 }); } catch (e) {}
+    });
   }
 
   // Turn the map column into a flex split so the docked chart stays visible: the map
@@ -227,17 +310,36 @@
   let plot = null;
   let crosshair = null;
   let tooltip = null;
-  let playDot = null;
+  let playDots = [];
 
   function draw() {
     const el = document.getElementById(PLOT_ID);
     if (!el || el.offsetWidth === 0) return false;
+    const axisFont = { color: '#9aa0a6', size: 10 };
+    const tickColor = 'rgba(255,255,255,.08)';
+
+    if (isCompare()) {
+      const maxT = maxLapTime();
+      plot = $.plot($(el), buildCompareSeries(), {
+        xaxis: {
+          min: 0,
+          max: maxT,
+          ticks: timeTicks(maxT),
+          tickFormatter: fmtTime,
+          tickColor: tickColor,
+          font: axisFont,
+        },
+        yaxes: [{ position: 'left', min: 0, tickColor: tickColor, font: axisFont }],
+        grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000 },
+        legend: { show: false },
+      });
+      return true;
+    }
+
     const rider = primaryRider();
     if (!rider) return false;
 
     const maxT = (rider.data.length - 1) * DT;
-    const axisFont = { color: '#9aa0a6', size: 10 };
-    const tickColor = 'rgba(255,255,255,.08)';
 
     plot = $.plot($(el), buildSeries(rider), {
       xaxis: {
@@ -275,12 +377,21 @@
         'color:#fff;font-size:11px;line-height:1.5;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,.18);white-space:nowrap;';
       document.body.appendChild(tooltip);
     }
-    if (!playDot || playDot.parentNode !== el) {
-      playDot = document.createElement('div');
-      playDot.style.cssText =
-        'position:absolute;width:12px;height:12px;border-radius:50%;background:' + COLORS.speed +
+    // One chart dot per rider (compare) or one (single). Rebuild if detached.
+    if (playDots.length && playDots[0].parentNode !== el) {
+      playDots.forEach((d) => { try { d.remove(); } catch (e) {} });
+      playDots = [];
+    }
+    const nDots = isCompare() ? validRiders().length : 1;
+    while (playDots.length < nDots) {
+      const i = playDots.length;
+      const color = isCompare() ? riderColor(i) : COLORS.speed;
+      const dot = document.createElement('div');
+      dot.style.cssText =
+        'position:absolute;width:12px;height:12px;border-radius:50%;background:' + color +
         ';border:2px solid #fff;transform:translate(-50%,-50%);display:none;pointer-events:none;z-index:6;';
-      el.appendChild(playDot);
+      el.appendChild(dot);
+      playDots.push(dot);
     }
   }
 
@@ -291,18 +402,22 @@
     );
   }
 
-  // --- Map sync: a dot on the Leaflet map that follows the hovered chart point ---
-  let mapDot = null;
+  // --- Map sync: one dot per rider on the Leaflet map that follows the hovered point ---
+  let mapDots = [];
   let mapDotMap = null;
 
-  function setMapDot(lat, lng, color) {
+  function setMapDotAt(i, lat, lng, color) {
     const map = window.SRSRCNG && window.SRSRCNG.map;
     if (!map || !window.L) return;
-    if (!mapDot || mapDotMap !== map) {
-      if (mapDot && mapDotMap) {
-        try { mapDotMap.removeLayer(mapDot); } catch (e) {}
-      }
-      mapDot = window.L.circleMarker([lat, lng], {
+    if (mapDotMap !== map) {
+      // map instance changed (pane swap) -> drop the old markers
+      mapDots.forEach((d) => { try { mapDotMap && mapDotMap.removeLayer(d); } catch (e) {} });
+      mapDots = [];
+      mapDotMap = map;
+    }
+    let d = mapDots[i];
+    if (!d) {
+      d = window.L.circleMarker([lat, lng], {
         radius: 6,
         color: '#ffffff',
         weight: 2,
@@ -311,19 +426,22 @@
         opacity: 1,
         interactive: false,
       });
-      mapDotMap = map;
-      mapDot.addTo(map);
+      mapDots[i] = d;
+      d.addTo(map);
     } else {
-      mapDot.setLatLng([lat, lng]);
-      if (!map.hasLayer(mapDot)) mapDot.addTo(map);
+      d.setLatLng([lat, lng]);
+      if (!map.hasLayer(d)) d.addTo(map);
     }
-    if (mapDot.bringToFront) mapDot.bringToFront();
+    if (d.bringToFront) d.bringToFront();
   }
 
-  function hideMapDot() {
-    if (mapDot && mapDotMap) {
-      try { mapDotMap.removeLayer(mapDot); } catch (e) {}
-    }
+  // Single-rider convenience.
+  function setMapDot(lat, lng, color) {
+    setMapDotAt(0, lat, lng, color);
+  }
+
+  function hideMapDots() {
+    mapDots.forEach((d) => { try { mapDotMap && mapDotMap.removeLayer(d); } catch (e) {} });
   }
 
   // --- Track colouring: overlay the lap trace coloured by accel/brake ---
@@ -410,36 +528,21 @@
   function bindHover() {
     const el = document.getElementById(PLOT_ID);
     if (!el) return;
-    const rider = primaryRider();
-    const pts = rider.data;
-    const maxT = (pts.length - 1) * DT;
-    const dotColor = rider.color || '#fa554f';
+    const compare = isCompare();
+    const maxX = compare ? maxLapTime() : (primaryRider().data.length - 1) * DT;
 
     $(el)
       .off('plothover.srtele')
       .on('plothover.srtele', function (event, pos) {
-        if (!pos || pos.x == null || pos.x < 0 || pos.x > maxT) {
-          crosshair.style.display = 'none';
+        if (!pos || pos.x == null || pos.x < 0 || pos.x > maxX) {
           tooltip.style.display = 'none';
+          if (playing) renderPlaybackPos();
+          else hideTransient();
           return;
         }
-        let idx = Math.round(pos.x / DT);
-        if (idx < 0) idx = 0;
-        if (idx >= pts.length) idx = pts.length - 1;
-        const p = pts[idx];
-
-        const off = plot.pointOffset({ x: idx * DT, y: 0, yaxis: 1 });
-        crosshair.style.left = off.left + 'px';
-        crosshair.style.display = 'block';
-
-        setMapDot(p[0], p[1], dotColor);
-        updateLegend(idx);
-
-        tooltip.innerHTML =
-          '<div style="font-weight:600;margin-bottom:2px;">' + fmtTime(idx * DT) + '</div>' +
-          row(COLORS.speed, 'Speed', (p[2] * speedMult()).toFixed(2) + ' ' + speedUnit()) +
-          row(COLORS.g, 'Acc/Brk G', (p[4] / G).toFixed(2)) +
-          row(COLORS.lean, 'Lean Angle', p[5].toFixed(1));
+        // x is elapsed time in both modes now; the seek fns place dots + map markers +
+        // legend and return the tooltip HTML.
+        tooltip.innerHTML = compare ? seekToTime(pos.x) : seekTo(pos.x / DT);
         tooltip.style.left = event.pageX + 14 + 'px';
         tooltip.style.top = event.pageY - 10 + 'px';
         tooltip.style.display = 'block';
@@ -448,12 +551,10 @@
       .on('mouseleave.srtele', function () {
         tooltip.style.display = 'none';
         if (playing) {
-          seekTo(playIdx); // hand the crosshair/dot back to playback
+          renderPlaybackPos(); // hand the crosshair/dots back to playback
           return;
         }
-        crosshair.style.display = 'none';
-        if (playDot) playDot.style.display = 'none';
-        hideMapDot();
+        hideTransient();
       });
   }
 
@@ -472,13 +573,18 @@
     b.classList.toggle('is-playing', playing);
   }
 
-  // Position crosshair + chart dot + map dot + legend at a (fractional) sample index.
-  // Position everything at a FRACTIONAL sample index, interpolating between the two
-  // bracketing samples so playback is smooth (no per-0.1 s snapping/hopping).
+  function hideTransient() {
+    if (crosshair) crosshair.style.display = 'none';
+    playDots.forEach((d) => { d.style.display = 'none'; });
+    hideMapDots();
+  }
+
+  // SINGLE mode: position crosshair + chart dot + map dot + legend at a FRACTIONAL sample
+  // index, interpolating between bracketing samples for smooth playback. Returns tooltip HTML.
   function seekTo(idxFloat) {
-    if (!plot || !crosshair || !playDot) return;
+    if (!plot || !crosshair || !playDots[0]) return '';
     const rider = primaryRider();
-    if (!rider) return;
+    if (!rider) return '';
     const pts = rider.data;
     const maxIdx = pts.length - 1;
     if (idxFloat < 0) idxFloat = 0;
@@ -499,12 +605,74 @@
     crosshair.style.display = 'block';
 
     const sp = plot.pointOffset({ x: t, y: spd * speedMult(), yaxis: 1 });
-    playDot.style.left = sp.left + 'px';
-    playDot.style.top = sp.top + 'px';
-    playDot.style.display = 'block';
+    playDots[0].style.left = sp.left + 'px';
+    playDots[0].style.top = sp.top + 'px';
+    playDots[0].style.display = 'block';
 
     setMapDot(lat, lng, rider.color || '#fa554f');
     setLegendValues(spd, acc, lean);
+
+    return (
+      '<div style="font-weight:600;margin-bottom:2px;">' + fmtTime(t) + '</div>' +
+      row(COLORS.speed, 'Speed', (spd * speedMult()).toFixed(2) + ' ' + speedUnit()) +
+      row(COLORS.g, 'Acc/Brk G', (acc / G).toFixed(2)) +
+      row(COLORS.lean, 'Lean Angle', lean.toFixed(1))
+    );
+  }
+
+  // COMPARE mode: place every rider's chart dot + map dot + legend speed at an elapsed TIME.
+  // Each rider is sampled at the same time, clamped to its own lap length — so a faster lap's
+  // dot pulls ahead on the track and clamps at its finish once that lap ends. Returns tooltip.
+  function seekToTime(t) {
+    if (!plot || !crosshair) return '';
+    const riders = validRiders();
+    if (!riders.length) return '';
+    const maxT = maxLapTime();
+    if (t < 0) t = 0;
+    if (t > maxT) t = maxT;
+
+    const base = plot.pointOffset({ x: t, y: 0, yaxis: 1 });
+    crosshair.style.left = base.left + 'px';
+    crosshair.style.display = 'block';
+
+    const speeds = [];
+    let tip = '<div style="font-weight:600;margin-bottom:2px;">' + fmtTime(t) + '</div>';
+    riders.forEach((rider, i) => {
+      const pts = rider.data;
+      const last = pts.length - 1;
+      let fi = t / DT;
+      if (fi > last) fi = last; // shorter lap: clamp at its finish
+      const i0 = Math.floor(fi), i1 = Math.min(i0 + 1, last), f = fi - i0;
+      const a = pts[i0], b = pts[i1];
+      const lat = a[0] + (b[0] - a[0]) * f;
+      const lng = a[1] + (b[1] - a[1]) * f;
+      const spd = a[2] + (b[2] - a[2]) * f;
+      speeds.push(spd);
+      const dot = playDots[i];
+      if (dot) {
+        // chart dot rides this rider's own line, so anchor it at the rider's clamped time.
+        const sp = plot.pointOffset({ x: fi * DT, y: spd * speedMult(), yaxis: 1 });
+        dot.style.left = sp.left + 'px';
+        dot.style.top = sp.top + 'px';
+        dot.style.display = 'block';
+      }
+      setMapDotAt(i, lat, lng, riderColor(i));
+      tip += row(riderColor(i), riderLabel(i), (spd * speedMult()).toFixed(0) + ' ' + speedUnit());
+    });
+    setCompareLegend(speeds);
+    return tip;
+  }
+
+  function renderPlaybackPos() {
+    if (isCompare()) seekToTime(playIdx * DT);
+    else seekTo(playIdx);
+  }
+
+  // Playback is paced in real time. In compare mode it runs against the LONGEST lap so the
+  // whole race plays out (the faster rider finishes first and its dot waits at the line).
+  function paceRider() {
+    if (!isCompare()) return primaryRider();
+    return validRiders().reduce((a, b) => (b.data.length > a.data.length ? b : a));
   }
 
   function frame(ts) {
@@ -513,21 +681,21 @@
     if (lastTs == null) lastTs = ts;
     const dtSec = (ts - lastTs) / 1000;
     lastTs = ts;
-    const n = primaryRider().data.length;
+    const n = paceRider().data.length;
     playIdx += dtSec / DT; // real-time: advance one sample per 0.1 s elapsed
     if (playIdx >= n - 1) {
       playIdx = n - 1;
-      seekTo(playIdx);
+      renderPlaybackPos();
       stopPlayback();
       return;
     }
-    seekTo(playIdx);
+    renderPlaybackPos();
     rafId = window.requestAnimationFrame(frame);
   }
 
   function startPlayback() {
     if (playing) return;
-    const n = primaryRider().data.length;
+    const n = paceRider().data.length;
     if (playIdx >= n - 1) playIdx = 0; // restart from the beginning
     playing = true;
     lastTs = null;
@@ -550,15 +718,18 @@
   function render() {
     if (!ready()) return;
     if (window.SRSRCNG.currentlyViewing && window.SRSRCNG.currentlyViewing !== 'map') return;
-    renderTrackColour();
+    // In compare mode keep the site's two per-rider traces; only colour the trace solo.
+    if (!isCompare()) renderTrackColour();
     hideSiteSpeedChart();
     hidePlaybackControls();
+    hideSiteRiderMarkers();
     if (!ensurePanel()) return;
     applyLayout();
     if (draw()) {
       ensureOverlays();
       bindHover();
-      updateLegend(0); // seed the readout before the first hover
+      if (isCompare()) seedCompareLegend(); // seed each rider's readout
+      else updateLegend(0);
     }
   }
 
@@ -589,7 +760,9 @@
   let tries = 0;
   const poll = setInterval(() => {
     tries += 1;
-    if ((document.getElementById(PLOT_ID) && trackLayer) || tries > 60) {
+    // single mode also waits for the accel trace; compare mode has no overlay.
+    const chartUp = document.getElementById(PLOT_ID) && (isCompare() || trackLayer);
+    if (chartUp || tries > 60) {
       clearInterval(poll);
       return;
     }
