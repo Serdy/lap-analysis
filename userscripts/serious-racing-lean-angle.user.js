@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serious-Racing — Telemetry Chart (Speed + Acc/Brk G + Lean) + Track Colouring
 // @namespace    https://serious-racing.com/
-// @version      2.10.1
+// @version      2.10.3
 // @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. When two riders are compared, switches to a speed-only chart (one line + dot per rider) on a time axis so the faster rider pulls ahead on the map. Hides the site's play/scrubber bar and its static rider markers. JS-only, reads window.SRSRCNG — no server access needed.
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
@@ -60,7 +60,11 @@
       '.sr-play-btn:active{transform:translateY(-50%) scale(.93);transition-duration:.05s;}' +
       '.sr-play-btn:focus-visible{box-shadow:0 0 0 3px rgba(226,59,59,.45), 0 2px 7px rgba(0,0,0,.5) !important;}' +
       '.sr-play-btn.is-playing{filter:brightness(.96);}' +
-      '.sr-play-btn svg{display:block;}';
+      '.sr-play-btn svg{display:block;}' +
+      // Stop axis tick labels (e.g. negative lean values "-20","-40","-50") wrapping onto
+      // two lines. The label class name varies by Flot build, so target every div in the
+      // plot and let it lay out on one line with room to grow.
+      '#' + PLOT_ID + ' div{white-space:nowrap !important;width:auto !important;}';
     const el = document.createElement('style');
     el.id = 'sr-tele-styles';
     el.textContent = css;
@@ -353,7 +357,7 @@
       yaxes: [
         { position: 'left', min: 0, tickColor: tickColor, font: axisFont },
         { position: 'right', min: -1, max: 1, tickColor: tickColor, font: axisFont },
-        { position: 'right', min: -50, max: 50, ticks: [-50, -40, -20, 0, 20, 40, 50], tickColor: tickColor, font: axisFont },
+        { position: 'right', min: -50, max: 50, ticks: [-50, -40, -20, 0, 20, 40, 50], labelWidth: 26, tickColor: tickColor, font: axisFont },
       ],
       grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000 },
       legend: { show: false },
@@ -370,12 +374,24 @@
         'position:absolute;top:0;bottom:0;width:1px;background:#7a1f1f;display:none;pointer-events:none;z-index:5;';
       el.appendChild(crosshair);
     }
-    if (!tooltip) {
+    if (!tooltip || !tooltip.isConnected) {
+      // Host the tooltip in a fixed, viewport-sized, overflow-hidden layer. Because the
+      // layer is position:fixed and clips its overflow, the tooltip can never enlarge the
+      // document — so toggling it none<->block (or measuring it mid-reflow at a stale
+      // position) can no longer spawn a transient scrollbar / page jitter.
+      let layer = document.getElementById('sr-tip-layer');
+      if (!layer) {
+        layer = document.createElement('div');
+        layer.id = 'sr-tip-layer';
+        layer.style.cssText =
+          'position:fixed;left:0;top:0;right:0;bottom:0;overflow:hidden;pointer-events:none;z-index:9999;';
+        document.body.appendChild(layer);
+      }
       tooltip = document.createElement('div');
       tooltip.style.cssText =
-        'position:absolute;display:none;z-index:9999;pointer-events:none;background:rgba(20,20,20,.92);' +
+        'position:absolute;display:none;pointer-events:none;background:rgba(20,20,20,.92);' +
         'color:#fff;font-size:11px;line-height:1.5;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,.18);white-space:nowrap;';
-      document.body.appendChild(tooltip);
+      layer.appendChild(tooltip);
     }
     // One chart dot per rider (compare) or one (single). Rebuild if detached.
     if (playDots.length && playDots[0].parentNode !== el) {
@@ -416,15 +432,18 @@
     const tw = tooltip.offsetWidth;
     const th = tooltip.offsetHeight;
     const pad = 4;
+    // The tooltip lives in a position:fixed layer, so it's placed in viewport coordinates.
+    const cx = pageX - sx;
+    const cy = pageY - sy;
 
-    let left = pageX + 14;
-    let top = pageY - 10;
+    let left = cx + 14;
+    let top = cy - 10;
     // Flip to the left of the cursor if it would overflow the right edge.
-    if (left + tw > sx + vw - pad) left = pageX - tw - 14;
+    if (left + tw > vw - pad) left = cx - tw - 14;
     // Clamp vertically (the chart sits low, so the tooltip tends to overflow the bottom).
-    if (top + th > sy + vh - pad) top = sy + vh - th - pad;
-    if (left < sx + pad) left = sx + pad;
-    if (top < sy + pad) top = sy + pad;
+    if (top + th > vh - pad) top = vh - th - pad;
+    if (left < pad) left = pad;
+    if (top < pad) top = pad;
 
     tooltip.style.left = left + 'px';
     tooltip.style.top = top + 'px';
