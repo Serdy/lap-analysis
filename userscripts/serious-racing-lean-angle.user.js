@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serious-Racing — Telemetry Chart (Speed + Acc/Brk G + Lean) + Track Colouring
 // @namespace    https://serious-racing.com/
-// @version      2.10.0
+// @version      2.10.1
 // @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. When two riders are compared, switches to a speed-only chart (one line + dot per rider) on a time axis so the faster rider pulls ahead on the map. Hides the site's play/scrubber bar and its static rider markers. JS-only, reads window.SRSRCNG — no server access needed.
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
@@ -402,6 +402,34 @@
     );
   }
 
+  // Place the tooltip near the cursor but clamped to the visible viewport, so it can never
+  // poke past the document edge and add a transient document-level scrollbar (which would
+  // show as a second scrollbar next to the sidebar's own). clientWidth/Height exclude any
+  // existing scrollbars, so clamping against them can't itself create new overflow.
+  function positionTooltip(pageX, pageY) {
+    if (!tooltip) return;
+    const doc = document.documentElement;
+    const vw = doc.clientWidth;
+    const vh = doc.clientHeight;
+    const sx = window.pageXOffset || doc.scrollLeft || 0;
+    const sy = window.pageYOffset || doc.scrollTop || 0;
+    const tw = tooltip.offsetWidth;
+    const th = tooltip.offsetHeight;
+    const pad = 4;
+
+    let left = pageX + 14;
+    let top = pageY - 10;
+    // Flip to the left of the cursor if it would overflow the right edge.
+    if (left + tw > sx + vw - pad) left = pageX - tw - 14;
+    // Clamp vertically (the chart sits low, so the tooltip tends to overflow the bottom).
+    if (top + th > sy + vh - pad) top = sy + vh - th - pad;
+    if (left < sx + pad) left = sx + pad;
+    if (top < sy + pad) top = sy + pad;
+
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  }
+
   // --- Map sync: one dot per rider on the Leaflet map that follows the hovered point ---
   let mapDots = [];
   let mapDotMap = null;
@@ -543,9 +571,8 @@
         // x is elapsed time in both modes now; the seek fns place dots + map markers +
         // legend and return the tooltip HTML.
         tooltip.innerHTML = compare ? seekToTime(pos.x) : seekTo(pos.x / DT);
-        tooltip.style.left = event.pageX + 14 + 'px';
-        tooltip.style.top = event.pageY - 10 + 'px';
         tooltip.style.display = 'block';
+        positionTooltip(event.pageX, event.pageY);
       })
       .off('mouseleave.srtele')
       .on('mouseleave.srtele', function () {
