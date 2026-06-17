@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serious-Racing — Telemetry Chart (Speed + Acc/Brk G + Lean) + Track Colouring
 // @namespace    https://serious-racing.com/
-// @version      2.10.3
+// @version      2.11.1
 // @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. When two riders are compared, switches to a speed-only chart (one line + dot per rider) on a time axis so the faster rider pulls ahead on the map. Hides the site's play/scrubber bar and its static rider markers. JS-only, reads window.SRSRCNG — no server access needed.
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
@@ -37,7 +37,9 @@
   const DT = 0.1; // seconds per sample (10 Hz)
   const G = 9.81;
 
-  const COLORS = { speed: '#e23b3b', g: '#6cae3e', lean: '#3d7fd6' };
+  // Refined "instrument" palette: speed is the warm hero, G a clean emerald, lean a cool azure.
+  const COLORS = { speed: '#ff5c52', g: '#46cf86', lean: '#4ea8ff' };
+  const AXIS_FONT_FAMILY = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
 
   // Crisp, optically-centred SVG icons (unicode glyphs render off-centre).
   const ICON_PLAY =
@@ -64,7 +66,17 @@
       // Stop axis tick labels (e.g. negative lean values "-20","-40","-50") wrapping onto
       // two lines. The label class name varies by Flot build, so target every div in the
       // plot and let it lay out on one line with room to grow.
-      '#' + PLOT_ID + ' div{white-space:nowrap !important;width:auto !important;}';
+      '#' + PLOT_ID + ' div:not(.sr-ov){white-space:nowrap !important;width:auto !important;}' +
+      // Instrument-panel chrome behind the chart: subtle top-lit gradient + hairline accent.
+      '#' + PANEL_ID + '{background:linear-gradient(180deg,#1b1e24 0%,#0d0f13 100%) !important;' +
+      'border-top:1px solid rgba(255,255,255,.06);box-shadow:inset 0 1px 0 rgba(255,255,255,.05);}' +
+      // Readout legend: uppercase micro-labels + tabular mono values, like an instrument cluster.
+      '.sr-leg-chip{display:inline-flex;align-items:center;margin:0 13px;}' +
+      '.sr-leg-swatch{display:inline-block;width:16px;height:3px;border-radius:2px;margin-right:8px;}' +
+      '.sr-leg-label{font-size:9.5px;letter-spacing:1px;text-transform:uppercase;color:#838c9a;font-weight:600;}' +
+      '.sr-leg-val{display:inline-block;margin-left:8px;text-align:left;font-weight:600;' +
+      'font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;font-size:11.5px;' +
+      'font-family:' + AXIS_FONT_FAMILY + ';}';
     const el = document.createElement('style');
     el.id = 'sr-tele-styles';
     el.textContent = css;
@@ -72,7 +84,7 @@
   }
 
   // Track-trace colouring by longitudinal accel (m/s^2): accelerate / steady / brake.
-  const TRACK = { accel: '#39c463', steady: '#f2c200', brake: '#e23b3b' };
+  const TRACK = { accel: '#37d67a', steady: '#f0b429', brake: '#ff5c52' };
   const ACCEL_T = 0.5; // dead-band (~0.05 G) -> steady (yellow)
 
   const $ = window.jQuery;
@@ -146,9 +158,10 @@
       lean.push([t, pts[i][5]]);
     }
     return [
-      { label: 'Speed', data: speed, color: COLORS.speed, yaxis: 1, lines: { lineWidth: 1.4 }, shadowSize: 0 },
-      { label: 'Acc/Brk G', data: gforce, color: COLORS.g, yaxis: 2, lines: { lineWidth: 1.4 }, shadowSize: 0 },
-      { label: 'Lean Angle', data: lean, color: COLORS.lean, yaxis: 3, lines: { lineWidth: 1.4 }, shadowSize: 0 },
+      // Speed is the hero: a slightly thicker line (no fill — kept as a clean trace).
+      { label: 'Speed', data: speed, color: COLORS.speed, yaxis: 1, lines: { lineWidth: 1.8 }, shadowSize: 0 },
+      { label: 'Acc/Brk G', data: gforce, color: COLORS.g, yaxis: 2, lines: { lineWidth: 1.3 }, shadowSize: 0 },
+      { label: 'Lean Angle', data: lean, color: COLORS.lean, yaxis: 3, lines: { lineWidth: 1.3 }, shadowSize: 0 },
     ];
   }
 
@@ -197,12 +210,10 @@
 
   function legendChip(color, label, valueId, minW) {
     return (
-      '<span style="display:inline-flex;align-items:center;margin:0 10px;">' +
-      '<span style="display:inline-block;width:22px;height:3px;background:' + color + ';margin-right:5px;"></span>' +
-      label +
-      '<span id="' + valueId + '" style="display:inline-block;margin-left:6px;width:' + minW +
-      'px;text-align:left;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;' +
-      'overflow:hidden;color:' + color + ';">–</span>' +
+      '<span class="sr-leg-chip">' +
+      '<span class="sr-leg-swatch" style="background:' + color + ';box-shadow:0 0 7px ' + color + '88;"></span>' +
+      '<span class="sr-leg-label">' + label + '</span>' +
+      '<span id="' + valueId + '" class="sr-leg-val" style="width:' + minW + 'px;color:' + color + ';">–</span>' +
       '</span>'
     );
   }
@@ -313,14 +324,15 @@
 
   let plot = null;
   let crosshair = null;
-  let tooltip = null;
   let playDots = [];
 
   function draw() {
     const el = document.getElementById(PLOT_ID);
     if (!el || el.offsetWidth === 0) return false;
-    const axisFont = { color: '#9aa0a6', size: 10 };
-    const tickColor = 'rgba(255,255,255,.08)';
+    const axisFont = { color: '#727b8a', size: 9.5, family: AXIS_FONT_FAMILY, weight: '500' };
+    const tickColor = 'rgba(148,163,184,.07)';
+    // Subtle vertical gradient inside the plot area for depth (instrument-panel feel).
+    const plotBg = { colors: ['#171a20', '#0d0f13'] };
 
     if (isCompare()) {
       const maxT = maxLapTime();
@@ -334,7 +346,7 @@
           font: axisFont,
         },
         yaxes: [{ position: 'left', min: 0, tickColor: tickColor, font: axisFont }],
-        grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000 },
+        grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000, backgroundColor: plotBg },
         legend: { show: false },
       });
       return true;
@@ -359,7 +371,7 @@
         { position: 'right', min: -1, max: 1, tickColor: tickColor, font: axisFont },
         { position: 'right', min: -50, max: 50, ticks: [-50, -40, -20, 0, 20, 40, 50], labelWidth: 26, tickColor: tickColor, font: axisFont },
       ],
-      grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000 },
+      grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000, backgroundColor: plotBg },
       legend: { show: false },
     });
     return true;
@@ -370,28 +382,11 @@
     if (!el) return;
     if (!crosshair || crosshair.parentNode !== el) {
       crosshair = document.createElement('div');
+      crosshair.className = 'sr-ov';
       crosshair.style.cssText =
-        'position:absolute;top:0;bottom:0;width:1px;background:#7a1f1f;display:none;pointer-events:none;z-index:5;';
+        'position:absolute;top:0;bottom:0;width:1px;background:rgba(255,255,255,.32);' +
+        'box-shadow:0 0 6px rgba(255,255,255,.15);display:none;pointer-events:none;z-index:5;';
       el.appendChild(crosshair);
-    }
-    if (!tooltip || !tooltip.isConnected) {
-      // Host the tooltip in a fixed, viewport-sized, overflow-hidden layer. Because the
-      // layer is position:fixed and clips its overflow, the tooltip can never enlarge the
-      // document — so toggling it none<->block (or measuring it mid-reflow at a stale
-      // position) can no longer spawn a transient scrollbar / page jitter.
-      let layer = document.getElementById('sr-tip-layer');
-      if (!layer) {
-        layer = document.createElement('div');
-        layer.id = 'sr-tip-layer';
-        layer.style.cssText =
-          'position:fixed;left:0;top:0;right:0;bottom:0;overflow:hidden;pointer-events:none;z-index:9999;';
-        document.body.appendChild(layer);
-      }
-      tooltip = document.createElement('div');
-      tooltip.style.cssText =
-        'position:absolute;display:none;pointer-events:none;background:rgba(20,20,20,.92);' +
-        'color:#fff;font-size:11px;line-height:1.5;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,.18);white-space:nowrap;';
-      layer.appendChild(tooltip);
     }
     // One chart dot per rider (compare) or one (single). Rebuild if detached.
     if (playDots.length && playDots[0].parentNode !== el) {
@@ -403,9 +398,11 @@
       const i = playDots.length;
       const color = isCompare() ? riderColor(i) : COLORS.speed;
       const dot = document.createElement('div');
+      dot.className = 'sr-ov';
       dot.style.cssText =
-        'position:absolute;width:12px;height:12px;border-radius:50%;background:' + color +
-        ';border:2px solid #fff;transform:translate(-50%,-50%);display:none;pointer-events:none;z-index:6;';
+        'position:absolute;width:11px;height:11px;border-radius:50%;background:' + color +
+        ';border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.4),0 0 9px ' + color +
+        'cc;transform:translate(-50%,-50%);display:none;pointer-events:none;z-index:6;';
       el.appendChild(dot);
       playDots.push(dot);
     }
@@ -413,40 +410,9 @@
 
   function row(color, label, value) {
     return (
-      '<div><span style="display:inline-block;width:9px;height:9px;background:' + color +
-      ';margin-right:6px;border-radius:1px;"></span>' + label + ': ' + value + '</div>'
+      '<div class="sr-tip-row"><span class="k"><i style="background:' + color + '"></i>' + label +
+      '</span><span class="v">' + value + '</span></div>'
     );
-  }
-
-  // Place the tooltip near the cursor but clamped to the visible viewport, so it can never
-  // poke past the document edge and add a transient document-level scrollbar (which would
-  // show as a second scrollbar next to the sidebar's own). clientWidth/Height exclude any
-  // existing scrollbars, so clamping against them can't itself create new overflow.
-  function positionTooltip(pageX, pageY) {
-    if (!tooltip) return;
-    const doc = document.documentElement;
-    const vw = doc.clientWidth;
-    const vh = doc.clientHeight;
-    const sx = window.pageXOffset || doc.scrollLeft || 0;
-    const sy = window.pageYOffset || doc.scrollTop || 0;
-    const tw = tooltip.offsetWidth;
-    const th = tooltip.offsetHeight;
-    const pad = 4;
-    // The tooltip lives in a position:fixed layer, so it's placed in viewport coordinates.
-    const cx = pageX - sx;
-    const cy = pageY - sy;
-
-    let left = cx + 14;
-    let top = cy - 10;
-    // Flip to the left of the cursor if it would overflow the right edge.
-    if (left + tw > vw - pad) left = cx - tw - 14;
-    // Clamp vertically (the chart sits low, so the tooltip tends to overflow the bottom).
-    if (top + th > vh - pad) top = vh - th - pad;
-    if (left < pad) left = pad;
-    if (top < pad) top = pad;
-
-    tooltip.style.left = left + 'px';
-    tooltip.style.top = top + 'px';
   }
 
   // --- Map sync: one dot per rider on the Leaflet map that follows the hovered point ---
@@ -582,20 +548,17 @@
       .off('plothover.srtele')
       .on('plothover.srtele', function (event, pos) {
         if (!pos || pos.x == null || pos.x < 0 || pos.x > maxX) {
-          tooltip.style.display = 'none';
           if (playing) renderPlaybackPos();
           else hideTransient();
           return;
         }
-        // x is elapsed time in both modes now; the seek fns place dots + map markers +
-        // legend and return the tooltip HTML.
-        tooltip.innerHTML = compare ? seekToTime(pos.x) : seekTo(pos.x / DT);
-        tooltip.style.display = 'block';
-        positionTooltip(event.pageX, event.pageY);
+        // x is elapsed time in both modes; the seek fns place the crosshair + chart dots +
+        // map markers and update the legend readout (no floating tooltip — the legend is it).
+        if (compare) seekToTime(pos.x);
+        else seekTo(pos.x / DT);
       })
       .off('mouseleave.srtele')
       .on('mouseleave.srtele', function () {
-        tooltip.style.display = 'none';
         if (playing) {
           renderPlaybackPos(); // hand the crosshair/dots back to playback
           return;
@@ -659,7 +622,7 @@
     setLegendValues(spd, acc, lean);
 
     return (
-      '<div style="font-weight:600;margin-bottom:2px;">' + fmtTime(t) + '</div>' +
+      '<div class="sr-tip-time">' + fmtTime(t) + '</div>' +
       row(COLORS.speed, 'Speed', (spd * speedMult()).toFixed(2) + ' ' + speedUnit()) +
       row(COLORS.g, 'Acc/Brk G', (acc / G).toFixed(2)) +
       row(COLORS.lean, 'Lean Angle', lean.toFixed(1))
@@ -682,7 +645,7 @@
     crosshair.style.display = 'block';
 
     const speeds = [];
-    let tip = '<div style="font-weight:600;margin-bottom:2px;">' + fmtTime(t) + '</div>';
+    let tip = '<div class="sr-tip-time">' + fmtTime(t) + '</div>';
     riders.forEach((rider, i) => {
       const pts = rider.data;
       const last = pts.length - 1;
