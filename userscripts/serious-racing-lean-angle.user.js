@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serious-Racing — Telemetry Chart (Speed + Acc/Brk G + Lean) + Track Colouring
 // @namespace    https://serious-racing.com/
-// @version      2.11.2
+// @version      2.12.0
 // @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. When two riders are compared, switches to a speed-only chart (one line + dot per rider) on a time axis so the faster rider pulls ahead on the map. Hides the site's play/scrubber bar and its static rider markers. JS-only, reads window.SRSRCNG — no server access needed.
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
@@ -67,6 +67,8 @@
       // two lines. The label class name varies by Flot build, so target every div in the
       // plot and let it lay out on one line with room to grow.
       '#' + PLOT_ID + ' div:not(.sr-ov){white-space:nowrap !important;width:auto !important;}' +
+      // The chart is clickable/draggable to set the playhead.
+      '#' + PLOT_ID + '{cursor:pointer;}' +
       // Instrument-panel chrome behind the chart: subtle top-lit gradient + hairline accent.
       '#' + PANEL_ID + '{background:linear-gradient(180deg,#1b1e24 0%,#0d0f13 100%) !important;' +
       'border-top:1px solid rgba(255,255,255,.06);box-shadow:inset 0 1px 0 rgba(255,255,255,.05);}' +
@@ -371,7 +373,7 @@
           font: axisFont,
         },
         yaxes: [{ position: 'left', min: 0, tickColor: tickColor, font: axisFont }],
-        grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000, backgroundColor: plotBg },
+        grid: { show: true, borderWidth: 0, hoverable: true, clickable: true, mouseActiveRadius: 1000, backgroundColor: plotBg },
         legend: { show: false },
       });
       return true;
@@ -396,7 +398,7 @@
         { position: 'right', min: -1, max: 1, tickColor: tickColor, font: axisFont },
         { position: 'right', min: -50, max: 50, ticks: [-50, -40, -20, 0, 20, 40, 50], labelWidth: 26, tickColor: tickColor, font: axisFont },
       ],
-      grid: { show: true, borderWidth: 0, hoverable: true, mouseActiveRadius: 1000, backgroundColor: plotBg },
+      grid: { show: true, borderWidth: 0, hoverable: true, clickable: true, mouseActiveRadius: 1000, backgroundColor: plotBg },
       legend: { show: false },
     });
     return true;
@@ -569,27 +571,36 @@
     const compare = isCompare();
     const maxX = compare ? maxLapTime() : (primaryRider().data.length - 1) * DT;
 
+    const inRange = (pos) => pos && pos.x != null && pos.x >= 0 && pos.x <= maxX;
+
     $(el)
       .off('plothover.srtele')
       .on('plothover.srtele', function (event, pos) {
-        if (!pos || pos.x == null || pos.x < 0 || pos.x > maxX) {
-          if (playing) renderPlaybackPos();
+        // While dragging, the hover position scrubs the playhead itself.
+        if (dragging && inRange(pos)) { setSeek(pos.x); return; }
+        if (!inRange(pos)) {
+          if (playing || hasSeeked) renderPlaybackPos(); // keep the playhead visible
           else hideTransient();
           return;
         }
-        // x is elapsed time in both modes; the seek fns place the crosshair + chart dots +
-        // map markers and update the legend readout (no floating tooltip — the legend is it).
+        // Plain hover = a preview that moves the crosshair + dots + map + legend readout,
+        // without moving the playhead. (No floating tooltip — the legend is the readout.)
         if (compare) seekToTime(pos.x);
         else seekTo(pos.x / DT);
       })
+      // Click anywhere on the chart sets the playhead; play then starts from there.
+      .off('plotclick.srtele')
+      .on('plotclick.srtele', function (event, pos) { if (inRange(pos)) setSeek(pos.x); })
+      .off('mousedown.srtele')
+      .on('mousedown.srtele', function () { dragging = true; })
       .off('mouseleave.srtele')
       .on('mouseleave.srtele', function () {
-        if (playing) {
-          renderPlaybackPos(); // hand the crosshair/dots back to playback
-          return;
-        }
-        hideTransient();
+        if (playing || hasSeeked) renderPlaybackPos(); // snap back to the playhead
+        else hideTransient();
       });
+
+    // A drag can end with the mouse released outside the chart, so listen on document.
+    $(document).off('mouseup.srtele').on('mouseup.srtele', function () { dragging = false; });
   }
 
   // --- Playback: animate a dot along the chart (and the map) over the lap time ---
@@ -597,6 +608,8 @@
   let playIdx = 0;
   let rafId = null;
   let lastTs = null;
+  let dragging = false; // scrubbing the playhead by dragging on the chart
+  let hasSeeked = false; // a playhead has been set (click/drag/play) -> keep it visible
 
   function setPlayIcon() {
     const b = document.getElementById('sr-play');
@@ -702,6 +715,18 @@
     else seekTo(playIdx);
   }
 
+  // Move the playhead to an elapsed time (s) and render it. Used by click + drag on the
+  // chart, so pressing play afterwards resumes from here (and clicking mid-play jumps).
+  function setSeek(t) {
+    const n = paceRider().data.length;
+    let idx = t / DT;
+    if (idx < 0) idx = 0;
+    if (idx > n - 1) idx = n - 1;
+    playIdx = idx;
+    hasSeeked = true;
+    renderPlaybackPos();
+  }
+
   // Playback is paced in real time. In compare mode it runs against the LONGEST lap so the
   // whole race plays out (the faster rider finishes first and its dot waits at the line).
   function paceRider() {
@@ -731,7 +756,8 @@
     if (playing) return;
     hideSiteRiderMarkers(); // re-hide any site dot that appeared after the initial render
     const n = paceRider().data.length;
-    if (playIdx >= n - 1) playIdx = 0; // restart from the beginning
+    if (playIdx >= n - 1) playIdx = 0; // at the very end -> restart from the beginning
+    hasSeeked = true; // keep the playhead visible once play has been used
     playing = true;
     lastTs = null;
     setPlayIcon();
