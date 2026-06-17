@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serious-Racing — Telemetry Chart (Speed + Acc/Brk G + Lean) + Track Colouring
 // @namespace    https://serious-racing.com/
-// @version      2.11.1
+// @version      2.11.2
 // @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. When two riders are compared, switches to a speed-only chart (one line + dot per rider) on a time axis so the faster rider pulls ahead on the map. Hides the site's play/scrubber bar and its static rider markers. JS-only, reads window.SRSRCNG — no server access needed.
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
@@ -296,14 +296,39 @@
     if (c) c.style.display = 'none';
   }
 
-  // Hide the site's own static rider position markers (SRSRCNG.dataMarker, one CircleMarker
-  // per rider, parked at the start line). Redundant now that we own the moving dots.
+  // Hide the site's own position markers (SRSRCNG.dataMarker, parked at the start line).
+  // Redundant now that we own the moving dots. Handles single/array/nested values and both
+  // CircleMarker (setStyle) and icon markers (setOpacity), and removes them outright.
   function hideSiteRiderMarkers() {
-    const dm = window.SRSRCNG && window.SRSRCNG.dataMarker;
-    const list = Array.isArray(dm) ? dm : dm ? [dm] : [];
-    list.forEach((m) => {
-      try { if (m && m.setStyle) m.setStyle({ opacity: 0, fillOpacity: 0 }); } catch (e) {}
+    const map = window.SRSRCNG && window.SRSRCNG.map;
+    const out = [];
+    const collect = (x) => { if (!x) return; Array.isArray(x) ? x.forEach(collect) : out.push(x); };
+    collect(window.SRSRCNG && window.SRSRCNG.dataMarker);
+    out.forEach((m) => {
+      try {
+        if (m.setStyle) m.setStyle({ opacity: 0, fillOpacity: 0 });
+        if (m.setOpacity) m.setOpacity(0);
+        if (map && map.hasLayer && map.hasLayer(m)) map.removeLayer(m);
+      } catch (e) {}
     });
+
+    // Compare playback: a stray site dot can linger on the start line even after the above
+    // (it can be created after our first pass). Sweep any CircleMarker still parked at the
+    // start line that isn't one of our own dots, and hide it.
+    if (map && window.L && isCompare()) {
+      const r0 = validRiders()[0];
+      if (!r0) return;
+      const start = window.L.latLng(r0.data[0][0], r0.data[0][1]);
+      map.eachLayer((l) => {
+        if (l instanceof window.L.CircleMarker && mapDots.indexOf(l) === -1) {
+          try {
+            if (l.getLatLng && map.distance(l.getLatLng(), start) < 8) {
+              l.setStyle({ opacity: 0, fillOpacity: 0 });
+            }
+          } catch (e) {}
+        }
+      });
+    }
   }
 
   // Turn the map column into a flex split so the docked chart stays visible: the map
@@ -704,6 +729,7 @@
 
   function startPlayback() {
     if (playing) return;
+    hideSiteRiderMarkers(); // re-hide any site dot that appeared after the initial render
     const n = paceRider().data.length;
     if (playIdx >= n - 1) playIdx = 0; // restart from the beginning
     playing = true;
