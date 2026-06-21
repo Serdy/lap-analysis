@@ -1,0 +1,9 @@
+{
+  "name": "serious-racing-unit-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Unit tests for the serious-racing userscript modules (node:test, no external deps)",
+  "scripts": {
+    "test": "node --test"
+  }
+}
