@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serious-Racing — Telemetry Chart (Speed + Acc/Brk G + Lean) + Track Colouring
 // @namespace    https://serious-racing.com/
-// @version      2.12.0
+// @version      2.13.0
 // @description  Adds a combined telemetry chart (Speed, Acc/Brk G-force, Lean angle) on a time axis with crosshair + multi-value tooltip, a map dot, accel/brake-coloured lap trace, and a play button that animates a dot along the chart + track. When two riders are compared, switches to a speed-only chart (one line + dot per rider) on a time axis so the faster rider pulls ahead on the map. Hides the site's play/scrubber bar and its static rider markers. JS-only, reads window.SRSRCNG — no server access needed.
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
@@ -47,6 +47,216 @@
   const ICON_PAUSE =
     '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><rect x="3.5" y="2.5" width="3" height="11" rx="1"/><rect x="9.5" y="2.5" width="3" height="11" rx="1"/></svg>';
 
+  // === BEGIN sr-track inline ===
+  // SOURCE OF TRUTH: userscripts/test/sr-track.js — keep in sync manually.
+  // Search "BEGIN sr-track inline" in both files to find both copies.
+
+  var SR_TRACK = (function () {
+    'use strict';
+
+    var DEFAULT_CFG = {
+      BRAKE_FLOOR: 0.3, wS: 1.0, wL: 0.15,
+      B_SCALE: 8.0,
+      A_SCALE_STRAIGHT: 1.5, A_SCALE_CORNER: 4.0, LEAN_GATE: 25, A_SCALE: 4.0,
+      speedSmoothWin: 5, col4SmoothWin: 3, leanSmoothWin: 5,
+      diffSpan: 3, aSpdClamp: 25,
+      scoreSmoothWin: 3, slewUp: 0.15, slewDown: 0.6, slew: 0.15, LEVELS: 11, MIN_RUN: 4,
+      col4DeadFrac: 0.70, leanSatFrac: 0.85, leanSatDeg: 40,
+      MPH_TO_MS: 0.44704, // col2 is mph base unit per CLAUDE.md; ×0.44704 → m/s
+      DT: 0.1, LEAN_DREF: 60,
+    };
+
+    function makeCfg(override) {
+      var cfg = {}, k;
+      for (k in DEFAULT_CFG) { if (Object.prototype.hasOwnProperty.call(DEFAULT_CFG, k)) cfg[k] = DEFAULT_CFG[k]; }
+      if (override) { for (k in override) { if (Object.prototype.hasOwnProperty.call(override, k)) cfg[k] = override[k]; } }
+      return cfg;
+    }
+
+    function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
+    function isFiniteNum(x) { return typeof x === 'number' && isFinite(x); }
+
+    function variance(arr) {
+      var n = arr.length, sum = 0, sq = 0, mean, i;
+      if (n < 2) return 0;
+      for (i = 0; i < n; i++) sum += arr[i];
+      mean = sum / n;
+      for (i = 0; i < n; i++) sq += (arr[i] - mean) * (arr[i] - mean);
+      return sq / n;
+    }
+
+    function centeredMA(arr, win) {
+      var n = arr.length, out = new Array(n), i, j, lo, hi, sum, cnt;
+      for (i = 0; i < n; i++) {
+        lo = Math.max(0, i - win); hi = Math.min(n - 1, i + win);
+        sum = 0; cnt = 0;
+        for (j = lo; j <= hi; j++) { if (isFiniteNum(arr[j])) { sum += arr[j]; cnt++; } }
+        out[i] = cnt > 0 ? sum / cnt : 0;
+      }
+      return out;
+    }
+
+    function centralDiff(arr, span, dt) {
+      var n = arr.length, out = new Array(n), i, s;
+      for (i = 0; i < n; i++) {
+        s = Math.min(span, i, n - 1 - i);
+        if (s === 0) {
+          if (i === 0 && n > 1)          out[i] = (arr[1] - arr[0]) / dt;
+          else if (i === n - 1 && n > 1) out[i] = (arr[n - 1] - arr[n - 2]) / dt;
+          else                            out[i] = 0;
+        } else {
+          out[i] = (arr[i + s] - arr[i - s]) / (2 * s * dt);
+        }
+      }
+      return out;
+    }
+
+    function validity(col4Arr, speedMphArr, leanArr, cfgOverride) {
+      if (typeof col4Arr === 'number') {
+        var db = (typeof speedMphArr === 'number') ? speedMphArr : 0.5;
+        if (col4Arr > db) return 'accel'; if (col4Arr < -db) return 'brake'; return 'steady';
+      }
+      var cfg = makeCfg(cfgOverride), n = Array.isArray(col4Arr) ? col4Arr.length : 0;
+      var useG = true, useS = true, useL = true, i;
+      if (n < 2) { useG = false; } else {
+        var dc = 0; for (i = 0; i < n; i++) { if (!isFiniteNum(col4Arr[i]) || Math.abs(col4Arr[i]) < 0.05) dc++; }
+        if (dc / n > cfg.col4DeadFrac || variance(col4Arr) < 1e-6) useG = false;
+      }
+      var sn = Array.isArray(speedMphArr) ? speedMphArr.length : 0;
+      if (sn < 2) { useS = false; } else {
+        var ok = false; for (i = 0; i < sn; i++) { if (isFiniteNum(speedMphArr[i])) { ok = true; break; } }
+        if (!ok || variance(speedMphArr) < 1e-9) useS = false;
+      }
+      if (!useG && !useS) return { bail: true };
+      var ln = Array.isArray(leanArr) ? leanArr.length : 0;
+      if (ln < 2) { useL = false; } else {
+        var sat = cfg.leanSatDeg * 0.99, sc = 0; for (i = 0; i < ln; i++) { if (!isFiniteNum(leanArr[i]) || Math.abs(leanArr[i]) >= sat) sc++; }
+        if (sc / ln > cfg.leanSatFrac || variance(leanArr) < 1e-6) useL = false;
+      }
+      return { useG: useG, useS: useS, useL: useL };
+    }
+
+    function _buildSignals(col4Arr, speedMphArr, leanArr, cfg) {
+      var n = col4Arr.length, i;
+      var g = centeredMA(col4Arr, Math.floor(cfg.col4SmoothWin / 2));
+      var v_ms = new Array(n);
+      for (i = 0; i < n; i++) v_ms[i] = isFiniteNum(speedMphArr[i]) ? speedMphArr[i] * cfg.MPH_TO_MS : 0;
+      var vs = centeredMA(v_ms, Math.floor(cfg.speedSmoothWin / 2));
+      var aSpd = centralDiff(vs, cfg.diffSpan, cfg.DT);
+      for (i = 0; i < n; i++) aSpd[i] = clamp(aSpd[i], -cfg.aSpdClamp, cfg.aSpdClamp);
+      var leanAbs = new Array(n);
+      for (i = 0; i < n; i++) leanAbs[i] = isFiniteNum(leanArr[i]) ? Math.abs(leanArr[i]) : 0;
+      var leanSmooth = centeredMA(leanAbs, Math.floor(cfg.leanSmoothWin / 2));
+      var dLean = centralDiff(leanSmooth, cfg.diffSpan, cfg.DT);
+      return { g: g, vs: vs, aSpd: aSpd, leanSmooth: leanSmooth, dLean: dLean };
+    }
+
+    function computeScore(col4Arr, speedMphArr, leanArr, valid, cfgOverride) {
+      if (typeof col4Arr === 'number') {
+        var db = (typeof speedMphArr === 'number') ? speedMphArr : 0.5;
+        var abs = col4Arr < 0 ? -col4Arr : col4Arr, beyond = abs - db;
+        if (beyond <= 0) return 0;
+        var s = beyond / (14.7 - db); return s > 1 ? 1 : s;
+      }
+      var cfg = makeCfg(cfgOverride), n = Array.isArray(col4Arr) ? col4Arr.length : 0;
+      if (n === 0) return [];
+      var useG = true, useS = true, useL = true;
+      if (valid && !valid.bail) { useG = valid.useG !== false; useS = valid.useS !== false; useL = valid.useL !== false; }
+      var sig = _buildSignals(col4Arr, speedMphArr, leanArr, cfg);
+      var g = sig.g, aSpd = sig.aSpd, dLean = sig.dLean, leanSmooth = sig.leanSmooth;
+      function aScaleFor(lm) { var t = clamp(lm / cfg.LEAN_GATE, 0, 1); return cfg.A_SCALE_STRAIGHT + (cfg.A_SCALE_CORNER - cfg.A_SCALE_STRAIGHT) * t; }
+      var raw = new Array(n), i, base, supp, lc;
+      for (i = 0; i < n; i++) {
+        var gi = useG ? g[i] : 0, aSi = useS ? aSpd[i] : 0;
+        lc = useL ? clamp(-dLean[i] / cfg.LEAN_DREF, 0, 1) : 0;
+        var aEff = aScaleFor(useL ? leanSmooth[i] : 0);
+        if (!useG) {
+          raw[i] = clamp(cfg.wS * clamp(aSi / aEff, -1, 1) + cfg.wL * lc, -1, 1);
+        } else if (gi <= -cfg.BRAKE_FLOOR) {
+          raw[i] = clamp(gi / cfg.B_SCALE, -1, 0);
+        } else {
+          base = clamp(Math.max(gi, 0) / aEff, 0, 1);
+          supp = cfg.wS * clamp(aSi / aEff, 0, 1) + cfg.wL * lc;
+          raw[i] = Math.max(base, supp);
+        }
+      }
+      var smoothed = centeredMA(raw, Math.floor(cfg.scoreSmoothWin / 2));
+      var sUp = cfg.slewUp != null ? cfg.slewUp : cfg.slew, sDn = cfg.slewDown != null ? cfg.slewDown : cfg.slew;
+      var out = new Array(n); out[0] = smoothed[0]; var delta;
+      for (i = 1; i < n; i++) {
+        delta = smoothed[i] - out[i - 1];
+        if (delta > sUp) delta = sUp; else if (delta < -sDn) delta = -sDn;
+        out[i] = out[i - 1] + delta;
+      }
+      return out;
+    }
+
+    function quantize(scoreArr, cfg) {
+      if (typeof scoreArr === 'number') {
+        var db = (typeof cfg === 'number') ? cfg : 0.5;
+        var zone = scoreArr > db ? 'accel' : scoreArr < -db ? 'brake' : 'steady';
+        return zone === 'accel' ? db : zone === 'brake' ? -db : 0;
+      }
+      var c = makeCfg(typeof cfg === 'object' ? cfg : undefined);
+      var n = Array.isArray(scoreArr) ? scoreArr.length : 0;
+      if (n === 0) return [];
+      var step = 2 / c.LEVELS, out = new Array(n), band, i;
+      for (i = 0; i < n; i++) {
+        band = Math.floor((clamp(scoreArr[i], -1, 1) + 1) / step);
+        out[i] = band >= c.LEVELS ? c.LEVELS - 1 : band;
+      }
+      return out;
+    }
+
+    function bandMidpoint(band, levels) {
+      if (levels === undefined) levels = DEFAULT_CFG.LEVELS;
+      return -1 + (band + 0.5) * (2 / levels);
+    }
+
+    function _hslToHex(h, s, l) {
+      var c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+      var r, g, b; h = ((h % 360) + 360) % 360;
+      if      (h <  60) { r = c; g = x; b = 0; }
+      else if (h < 120) { r = x; g = c; b = 0; }
+      else if (h < 180) { r = 0; g = c; b = x; }
+      else if (h < 240) { r = 0; g = x; b = c; }
+      else if (h < 300) { r = x; g = 0; b = c; }
+      else              { r = c; g = 0; b = x; }
+      function toHex(v) { var n = Math.round((v + m) * 255); n = n < 0 ? 0 : n > 255 ? 255 : n; return (n < 16 ? '0' : '') + n.toString(16); }
+      return '#' + toHex(r) + toHex(g) + toHex(b);
+    }
+
+    function scoreToColor(score, cfgIgnored) {
+      if (typeof score === 'string') {
+        if (score === 'accel') return '#37d67a';
+        if (score === 'brake') return '#ff5c52';
+        return '#f0b429';
+      }
+      var BRAKE = { h: 4, s: 100, l: 59 }, NEUTRAL = { h: 46, s: 100, l: 48 }, ACCEL = { h: 147, s: 67, l: 49 };
+      var s = isFiniteNum(score) ? clamp(score, -1, 1) : 0;
+      var t = (s + 1) / 2, half = t - 0.5, sign = half < 0 ? -1 : half > 0 ? 1 : 0;
+      var tb = sign * Math.pow(Math.abs(half) * 2, 0.75) / 2 + 0.5;
+      var from, to, frac;
+      if (tb <= 0.5) { frac = tb / 0.5; from = BRAKE; to = NEUTRAL; }
+      else           { frac = (tb - 0.5) / 0.5; from = NEUTRAL; to = ACCEL; }
+      return _hslToHex(from.h + (to.h - from.h) * frac, (from.s + (to.s - from.s) * frac) / 100, (from.l + (to.l - from.l) * frac) / 100);
+    }
+
+    function bandToColor(band, cfg) {
+      var c = makeCfg(typeof cfg === 'object' ? cfg : undefined);
+      return scoreToColor(bandMidpoint(band, c.LEVELS));
+    }
+
+    return {
+      validity: validity, computeScore: computeScore, quantize: quantize,
+      scoreToColor: scoreToColor, bandMidpoint: bandMidpoint, bandToColor: bandToColor,
+      DEFAULT_CFG: DEFAULT_CFG,
+      _centeredMA: centeredMA, _centralDiff: centralDiff, _buildSignals: _buildSignals, _hslToHex: _hslToHex,
+    };
+  }());
+
+  // === END sr-track inline ===
+
   function ensureStyles() {
     if (document.getElementById('sr-tele-styles')) return;
     const css =
@@ -84,10 +294,6 @@
     el.textContent = css;
     document.head.appendChild(el);
   }
-
-  // Track-trace colouring by longitudinal accel (m/s^2): accelerate / steady / brake.
-  const TRACK = { accel: '#37d67a', steady: '#f0b429', brake: '#ff5c52' };
-  const ACCEL_T = 0.5; // dead-band (~0.05 G) -> steady (yellow)
 
   const $ = window.jQuery;
 
@@ -488,12 +694,6 @@
   let trackLayer = null;
   let trackLayerMap = null;
 
-  function trackColor(accel) {
-    if (accel > ACCEL_T) return TRACK.accel;
-    if (accel < -ACCEL_T) return TRACK.brake;
-    return TRACK.steady;
-  }
-
   // Render our colour trace in a pane *below* overlayPane so the site's moving playback
   // dot (a CircleMarker in overlayPane) and the numbered sector markers stay on top.
   const TRACE_PANE = 'srTrace';
@@ -519,46 +719,98 @@
     });
   }
 
+  // Restore the site's flat polyline to visible (used on bail path so the map isn't blank).
+  function showSiteLapLine(map) {
+    map.eachLayer((l) => {
+      if (l instanceof window.L.Polyline && !(l instanceof window.L.Polygon)) {
+        try {
+          const ll = l.getLatLngs();
+          const n = Array.isArray(ll) ? ll.flat(3).length : 0;
+          if (n > 50) l.setStyle({ opacity: 1 });
+        } catch (e) {}
+      }
+    });
+  }
+
   function renderTrackColour() {
     const map = window.SRSRCNG && window.SRSRCNG.map;
     if (!map || !window.L) return;
     if (trackLayer && trackLayerMap === map) return; // already drawn for this map instance
     if (trackLayer && trackLayerMap) {
       try { trackLayerMap.removeLayer(trackLayer); } catch (e) {}
+      trackLayer = null;
+      trackLayerMap = null;
     }
     const rider = primaryRider();
     if (!rider) return;
+
+    // --- SR_TRACK pipeline ---
+    const pts = rider.data;
+    const col4     = pts.map((p) => p[4]);
+    const speedMph = pts.map((p) => p[2]); // col2 is mph base unit per CLAUDE.md
+    const lean     = pts.map((p) => p[5]);
+
+    const valid = SR_TRACK.validity(col4, speedMph, lean);
+    if (valid.bail) {
+      // Both sensors unusable — leave the site's default flat line visible and draw nothing.
+      showSiteLapLine(map);
+      return;
+    }
+
+    const score = SR_TRACK.computeScore(col4, speedMph, lean, valid);
+    const rawBand = SR_TRACK.quantize(score);
+
+    // MIN_RUN absorption: merge runs shorter than cfg.MIN_RUN samples into the previous run.
+    const MIN_RUN = SR_TRACK.DEFAULT_CFG.MIN_RUN; // 4 samples = 0.4 s
+    const band = rawBand.slice(); // work on a copy
+    let i = 0;
+    while (i < band.length) {
+      // Find end of current run
+      let j = i + 1;
+      while (j < band.length && band[j] === band[i]) j++;
+      const runLen = j - i;
+      if (runLen < MIN_RUN && i > 0) {
+        // Absorb into previous run's band value
+        const prev = band[i - 1];
+        for (let k = i; k < j; k++) band[k] = prev;
+        // Don't advance i — the absorbed samples now belong to the previous run;
+        // merge backward by re-scanning from the previous run boundary.
+        // To avoid O(n²) on adversarial input, just continue forward — the next
+        // iteration will naturally extend the previous band's run.
+      }
+      i = j;
+    }
+
     ensureTracePane(map);
     hideSiteLapLine(map);
-    const pts = rider.data;
+
     const group = window.L.layerGroup();
 
-    // Merge consecutive same-colour points into runs to keep the layer count low.
-    let runColor = trackColor(pts[0][4]);
+    // Merge consecutive equal-band points into polyline runs (boundary-overlap so runs connect).
+    let runBand = band[0];
     let coords = [[pts[0][0], pts[0][1]]];
-    const flush = (color) => {
+    const flush = (b) => {
       if (coords.length > 1) {
         window.L.polyline(coords, {
-          pane: TRACE_PANE,
-          color: color,
-          weight: 5,
-          opacity: 0.95,
-          lineCap: 'round',
-          lineJoin: 'round',
+          pane:        TRACE_PANE,
+          color:       SR_TRACK.bandToColor(b),
+          weight:      5,
+          opacity:     0.92,
+          lineCap:     'round',
+          lineJoin:    'round',
           interactive: false,
         }).addTo(group);
       }
     };
-    for (let i = 1; i < pts.length; i++) {
-      const c = trackColor(pts[i][4]);
+    for (i = 1; i < pts.length; i++) {
       coords.push([pts[i][0], pts[i][1]]);
-      if (c !== runColor) {
-        flush(runColor);
-        coords = [[pts[i][0], pts[i][1]]]; // overlap by the boundary point so runs connect
-        runColor = c;
+      if (band[i] !== runBand) {
+        flush(runBand);
+        coords = [[pts[i][0], pts[i][1]]]; // overlap by boundary point so runs connect
+        runBand = band[i];
       }
     }
-    flush(runColor);
+    flush(runBand);
 
     group.addTo(map);
     trackLayer = group;
