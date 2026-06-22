@@ -6,6 +6,10 @@
 // @match        https://serious-racing.com/laptimes/*
 // @run-at       document-idle
 // @grant        none
+// @homepageURL  https://github.com/Serdy/lap-analysis
+// @supportURL   https://github.com/Serdy/lap-analysis/issues
+// @downloadURL  https://github.com/Serdy/lap-analysis/releases/latest/download/serious-racing-lean-angle.user.js
+// @updateURL    https://github.com/Serdy/lap-analysis/releases/latest/download/serious-racing-lean-angle.user.js
 // ==/UserScript==
 
 /*
