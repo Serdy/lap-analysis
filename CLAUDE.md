@@ -146,8 +146,15 @@ Greasemonkey userscript** matched on `https://serious-racing.com/laptimes/*`, re
   pins an explicit px height), append our chart as the last child, then call
   `SRSRCNG.map.invalidateSize()` so Leaflet re-renders at the new size. The redundant site
   speed-only chart is hidden (`#sidebar-graph-container`'s `.loadgraph`/`.row` → `display:none`).
-- Authoring in **TypeScript** is fine, but the injected userscript must be plain compiled JS
-  (no build step runs in the page). Current scripts are hand-written JS for simplicity.
+- The injected userscript must be plain JS that runs in the page (no transpile/bundler runs
+  in the browser; `@grant none`). The shipped `serious-racing-lean-angle.user.js` is therefore
+  a **single file**, but it is **generated** — do not edit it by hand. Author in
+  `userscripts/src/` (ordered `NN-*.js` fragments + the shared, unit-tested `src/sr-track.js`)
+  and run `node userscripts/build.mjs` (`npm run build`), which concatenates the fragments
+  inside one IIFE and injects the `SR_TRACK` body so there is one source of truth. The
+  generated `serious-racing-lean-angle.user.js` is **git-ignored** (a build artifact): build
+  it locally to test/install, or grab it from the GitHub Actions `userscript` workflow, which
+  uploads it as an artifact. See `userscripts/test/README.md`.
 
 ## Gotchas
 
