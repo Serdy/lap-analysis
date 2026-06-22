@@ -3,3 +3,5 @@
 .playwright-cli/
 node_modules/
 .env
+.claude/
+userscripts/serious-racing-lean-angle.user.js

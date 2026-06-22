@@ -4,7 +4,7 @@
  * Design-spec validation tests for SR_TRACK array-based pipeline.
  *
  * These tests validate the APPROVED DESIGN SPEC for the track-coloring module
- * against the implementation in userscripts/sr-track.js.
+ * against the implementation in userscripts/src/sr-track.js.
  *
  * Run: npm test (or: node --test)
  *
@@ -22,7 +22,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-const SR_TRACK = require('./sr-track.js');
+const SR_TRACK = require('../src/sr-track.js');
 
 // ---------------------------------------------------------------------------
 // Helper: approximate floating-point equality (for HSL → RGB rounding)

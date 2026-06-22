@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Unit tests for SR_TRACK (userscripts/sr-track.js).
+ * Unit tests for SR_TRACK (userscripts/src/sr-track.js).
  *
  * Run:  node --test  (from this directory)
  *   or: npm test
@@ -12,7 +12,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-const SR_TRACK = require('./sr-track.js');
+const SR_TRACK = require('../src/sr-track.js');
 
 // ---------------------------------------------------------------------------
 // Seam smoke test: the import itself must work and expose all four methods.

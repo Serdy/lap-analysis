@@ -1,0 +1,10 @@
+{
+  "name": "serious-racing-userscript",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Build for the serious-racing telemetry userscript: assembles src/ fragments into the single shipped .user.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.js"
+  }
+}

@@ -1,0 +1,39 @@
+name: userscript
+
+on:
+  push:
+    paths:
+      - 'userscripts/**'
+      - '.github/workflows/userscript.yml'
+  pull_request:
+    paths:
+      - 'userscripts/**'
+      - '.github/workflows/userscript.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: userscripts
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      # No dependencies: tests use node:test, build.mjs is zero-dep — nothing to install.
+      - name: Unit tests
+        run: npm test
+
+      - name: Build userscript
+        run: npm run build
+
+      - name: Upload built userscript
+        uses: actions/upload-artifact@v4
+        with:
+          name: serious-racing-lean-angle.user.js
+          path: userscripts/serious-racing-lean-angle.user.js
+          if-no-files-found: error
