@@ -11,8 +11,12 @@
     if (draw()) {
       ensureOverlays();
       bindHover();
-      if (isCompare()) seedCompareLegend(); // seed each rider's readout
-      else updateLegend(0);
+      if (isCompare()) {
+        seedCompareLegend(); // seed each rider's readout
+        renderCompareEvents(); // render braking-onset + corner markers
+      } else {
+        updateLegend(0);
+      }
     }
   }
 
@@ -51,4 +55,38 @@
     }
     render();
   }, 250);
+
+  // --- Independent srEvents (braking triangles + corner chips) bootstrap ---
+  //
+  // Why this exists: the site sometimes serves ITS OWN older copy of this exact
+  // userscript (bundled as plugins-serdiuk-analysis.min.js) that builds #sr-tele-panel
+  // + the plot before ours runs. When that happens, `chartUp` above is already true on
+  // the very first poll tick, so the poll clears without ever calling render() — and
+  // since render() is the only place that calls renderCompareEvents(), the srEvents
+  // overlay silently never appears even though we're loaded and running.
+  //
+  // renderCompareEvents() (05-map.js) is fully self-contained: it only needs isCompare()
+  // + window.SRSRCNG.map + window.L, owns its own pane or events, and is idempotent
+  // (map-instance guard bails out if already built for the current map). So instead of
+  // fighting the foreign copy for the chart panel — which would double up MainLoop /
+  // handlers / DOM — we give the overlay its OWN poll + observer that never checks
+  // PANEL_ID/PLOT_ID at all, and never calls the chart's render()/draw().
+  let eventsTries = 0;
+  const eventsPoll = setInterval(() => {
+    eventsTries += 1;
+    const eventsUp = isCompare() && window.SRSRCNG && window.SRSRCNG.map && window.L;
+    if (eventsUp) renderCompareEvents();
+    // Keep polling even after success: the map can be replaced (pane .html() swap)
+    // after our first render, and renderCompareEvents()'s own map-instance guard makes
+    // repeat calls a cheap no-op when nothing changed.
+    if (eventsTries > 60) clearInterval(eventsPoll);
+  }, 250);
+
+  // Re-run on map-pane swaps regardless of who owns #sr-tele-panel/the plot — this is
+  // deliberately a SEPARATE branch from the render() rebuild above (which only fires
+  // when our panel is missing) so it also fires when a foreign copy's panel is present.
+  const eventsObs = new MutationObserver(() => {
+    if (isCompare() && mapPaneReady()) renderCompareEvents();
+  });
+  eventsObs.observe(document.body, { childList: true, subtree: true });
 })();
