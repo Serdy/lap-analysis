@@ -11,8 +11,12 @@
     if (draw()) {
       ensureOverlays();
       bindHover();
-      if (isCompare()) seedCompareLegend(); // seed each rider's readout
-      else updateLegend(0);
+      if (isCompare()) {
+        seedCompareLegend(); // seed each rider's readout
+        renderCompareEvents(); // render braking-onset + corner markers
+      } else {
+        updateLegend(0);
+      }
     }
   }
 
